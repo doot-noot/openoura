@@ -6,6 +6,7 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.os.Bundle
@@ -61,8 +62,26 @@ class MainActivity : Activity() {
         button("Pair (factory-reset ring only)") { confirmPair() }
         button("Back up auth key") { showKey() }
         button("Restore auth key") { restoreKey() }
+        button("Export database") { exportDb() }
+
+        // ---- Ask AI ----
+        col.addView(TextView(this).apply { text = "\nAsk AI about your data"; textSize = 16f })
+        button("AI settings") { aiSettings() }
+        chatView = TextView(this).apply { textSize = 14f; setTextIsSelectable(true); setPadding(0, pad / 2, 0, pad / 2) }
+        col.addView(chatView)
+        val input = EditText(this).apply { hint = "e.g. How did I sleep this week vs last?" }
+        col.addView(input)
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row.addView(Button(this).apply {
+            text = "Send"; setOnClickListener { ask(input.text.toString()); input.setText("") }
+        })
+        row.addView(Button(this).apply {
+            text = "New chat"; setOnClickListener { turns.clear(); systemPrompt = null; chatView.text = "" }
+        })
+        col.addView(row)
 
         summary = TextView(this).apply { typeface = Typeface.MONOSPACE; textSize = 12f; setPadding(0, pad, 0, pad) }
+        col.addView(TextView(this).apply { text = "\nSummary (raw)"; textSize = 14f })
         col.addView(summary)
         col.addView(TextView(this).apply { text = "Log"; textSize = 14f })
         logView = TextView(this).apply { typeface = Typeface.MONOSPACE; textSize = 11f }
@@ -194,5 +213,104 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------------- Export ----------------
+
+    private fun exportDb() {
+        if (!File(dbPath).exists()) return toast("Nothing to export yet — sync first.")
+        startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/vnd.sqlite3"
+            putExtra(Intent.EXTRA_TITLE, "openring-${System.currentTimeMillis() / 1000}.db")
+        }, REQ_EXPORT)
+    }
+
+    @Deprecated("Activity result API kept dependency-free")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val uri = data?.data
+        if (requestCode != REQ_EXPORT || resultCode != RESULT_OK || uri == null) return
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    // Consistent snapshot via SQLite's backup API, then copy out.
+                    val tmp = File(cacheDir, "export.db").apply { delete() }
+                    backupDatabase(dbPath, tmp.absolutePath)
+                    contentResolver.openOutputStream(uri)!!.use { out -> tmp.inputStream().use { it.copyTo(out) } }
+                    tmp.delete()
+                }
+                toast("Exported.")
+            } catch (e: Exception) { toast("Export failed: ${e.message}") }
+        }
+    }
+
+    // ---------------- AI ----------------
+
+    private lateinit var chatView: TextView
+    private val turns = mutableListOf<Turn>()
+    private var systemPrompt: String? = null
+
+    private fun provider(): AiProvider? {
+        val key = prefs.getString("claude_key", null) ?: return null
+        return ClaudeProvider(key, prefs.getString("claude_model", null) ?: DEFAULT_MODEL)
+    }
+
+    private fun aiSettings() {
+        val pad = (16 * resources.displayMetrics.density).toInt()
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, 0, pad, 0) }
+        val key = EditText(this).apply {
+            hint = "Anthropic API key (sk-ant-…)"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setText(prefs.getString("claude_key", ""))
+        }
+        val model = EditText(this).apply { hint = DEFAULT_MODEL; setText(prefs.getString("claude_model", DEFAULT_MODEL)) }
+        box.addView(TextView(this).apply {
+            text = "Claude sees your data summary when you send a question. Key is stored on this phone only."
+        })
+        box.addView(key); box.addView(model)
+        AlertDialog.Builder(this).setTitle("AI settings").setView(box)
+            .setPositiveButton("Save") { _, _ ->
+                prefs.edit().putString("claude_key", key.text.toString().trim())
+                    .putString("claude_model", model.text.toString().trim().ifEmpty { DEFAULT_MODEL }).apply()
+            }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun ask(question: String) {
+        val q = question.trim()
+        if (q.isEmpty()) return
+        val ai = provider() ?: return toast("Add your API key in AI settings first.")
+        if (!File(dbPath).exists()) return toast("Sync first so there's data to talk about.")
+        turns += Turn("user", q)
+        renderChat("…thinking")
+        scope.launch {
+            try {
+                val reply = withContext(Dispatchers.IO) {
+                    // Build the data context once per chat; "New chat" refreshes it.
+                    val sys = systemPrompt ?: HealthPrompt.system(summaryJson(dbPath, tzHours())).also { systemPrompt = it }
+                    ai.chat(sys, turns)
+                }
+                turns += Turn("assistant", reply)
+                renderChat()
+            } catch (e: Exception) {
+                turns.removeAt(turns.lastIndex)
+                renderChat("Error: ${e.message}")
+            }
+        }
+    }
+
+    private fun renderChat(pending: String? = null) {
+        chatView.text = buildString {
+            turns.forEach { append(if (it.role == "user") "You: " else "AI: ").append(it.text).append("\n\n") }
+            pending?.let { append(it) }
+        }
+    }
+
+    private fun tzHours() = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 3_600_000L
+
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+
+    companion object {
+        const val REQ_EXPORT = 42
+        const val DEFAULT_MODEL = "claude-sonnet-5-5"
+    }
 }
